@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import Attention
 
 
 def modulate(x, shift, scale):
@@ -63,6 +63,25 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # not used in the final model
+        x = x + self.pe[:x.shape[0], :]
+        return self.dropout(x)
+
 
 class LabelEmbedder(nn.Module):
     """
@@ -93,6 +112,72 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+class PromptEncoder(nn.Module):
+    def __init__(self, encode_type, hidden_size, encoder_dim=None, dropout_prob=0.1):
+        super().__init__()
+        self.encode_type = encode_type
+        self.hidden_size = hidden_size
+        self.dropout_prob = dropout_prob
+
+        assert self.encode_type in ['clip', 'bert']
+        if self.encode_type == 'clip':
+            import clip
+            self.encoder_dim = encoder_dim if encoder_dim != None else 512
+            
+            clip_model, _ = clip.load('ViT-B/32', device='cpu', jit=False)
+            clip_model.eval()
+            for p in clip_model.parameters():
+                p.requires_grad = False
+
+            self.clip_model = clip_model
+            self.clip_tokenizer = clip.tokenize
+            self.embed_text = nn.Linear(self.encoder_dim, self.hidden_size)
+        elif self.encode_type == 'bert':
+            from transformers import DistilBertTokenizer, DistilBertModel
+            self.encoder_dim = encoder_dim if encoder_dim != None else 768
+
+            bert_model = DistilBertModel.from_pretrained("distilbert-base-uncased")
+            bert_model.eval()
+            for p in bert_model.parameters():
+                p.requires_grad = False
+
+            self.bert_model = bert_model
+            self.bert_tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+            self.embed_text = nn.Linear(self.encoder_dim, self.hidden_size)
+
+    def encode_text(self, texts):
+        device = next(self.parameters()).device
+        assert self.encode_type in ['clip', 'bert']
+        if self.encode_type == 'clip':
+            tokens = self.clip_tokenizer(texts, truncate=True).to(device)
+            enc_text = self.clip_model.encode_text(tokens)
+            return enc_text
+        elif self.encode_type == 'bert':
+            tokens = self.bert_tokenizer(texts.tolist(), return_tensors='pt', padding=True, truncation=True).to(device)
+            enc_output = self.bert_model(**tokens)
+            enc_text = enc_output.last_hidden_state
+            enc_text = enc_text[..., 0, :]
+            return enc_text
+
+    def encode_drop(self, enc_text, force_drop=False):
+        """
+        Drops labels to enable classifier-free guidance.
+        """
+        if force_drop is False:
+            mask = torch.rand(enc_text.shape, device=enc_text.device) < self.dropout_prob
+            enc_text = torch.where(mask, torch.zeros_like(enc_text), enc_text)
+            return enc_text
+        else:
+            return torch.zeros_like(enc_text)
+
+    def forward(self, texts, train, force_drop=False):
+        use_dropout = self.dropout_prob > 0
+        enc_text = self.encode_text(texts)
+        if (train and use_dropout) or force_drop:
+            enc_text = self.encode_drop(enc_text, force_drop)
+        emb_text = self.embed_text(enc_text)
+        return emb_text
+
 
 #################################################################################
 #                                 Core DiT Model                                #
@@ -108,8 +193,11 @@ class DiTBlock(nn.Module):
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -122,14 +210,27 @@ class DiTBlock(nn.Module):
         return x
 
 
+class InputLayer(nn.Module):
+    """
+    The input layer of DiT.
+    """
+    def __init__(self, hidden_size, joint_size):
+        super().__init__()
+        self.linear = nn.Linear(joint_size, hidden_size, bias=True)
+
+    def forward(self, x):
+        x = x.permute([0, 2, 1]).to(x.device)
+        x = self.linear(x)
+        return x
+
 class FinalLayer(nn.Module):
     """
     The final layer of DiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, joint_size):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        self.linear = nn.Linear(hidden_size, joint_size, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 2 * hidden_size, bias=True)
@@ -139,6 +240,7 @@ class FinalLayer(nn.Module):
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
+        x = x.permute([0, 2, 1])
         return x
 
 
@@ -148,35 +250,30 @@ class DiT(nn.Module):
     """
     def __init__(
         self,
-        input_size=32,
-        patch_size=2,
-        in_channels=4,
+        joint_size=263, 
+        motion_size=196,
         hidden_size=1152,
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
-        class_dropout_prob=0.1,
-        num_classes=1000,
-        learn_sigma=True,
+        dropout_prob=0.1,
+        encode_type='clip',
     ):
         super().__init__()
-        self.learn_sigma = learn_sigma
-        self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
-        self.patch_size = patch_size
+        self.joint_size = joint_size
+        self.motion_size = motion_size
         self.num_heads = num_heads
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.x_embedder = InputLayer(hidden_size, joint_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        num_patches = self.x_embedder.num_patches
+        self.y_embedder = PromptEncoder(encode_type, hidden_size, dropout_prob=dropout_prob)
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.motion_size, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = FinalLayer(hidden_size, joint_size)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -189,16 +286,15 @@ class DiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        pos_embed = get_1d_sincos_pos_embed(self.pos_embed.shape[-1], self.motion_size)
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        nn.init.constant_(self.x_embedder.linear.weight, 0)
+        nn.init.constant_(self.x_embedder.linear.bias, 0)
 
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        # Initialize prompt embedding table:
+        nn.init.normal_(self.y_embedder.embed_text.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -215,22 +311,7 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
-        """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
-
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, force_drop=False):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -239,31 +320,21 @@ class DiT(nn.Module):
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
+        y = self.y_embedder(y, self.training, force_drop=force_drop)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        x_cond = self.forward(x, t, y)
+        x_uncond = self.forward(x, t, y, force_drop=True)
+        x = x_uncond + cfg_scale * (x_cond - x_uncond)
+        return x
 
 
 #################################################################################
@@ -271,18 +342,18 @@ class DiT(nn.Module):
 #################################################################################
 # https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+def get_2d_sincos_pos_embed(embed_dim, joint_size, motion_size, cls_token=False, extra_tokens=0):
     """
     grid_size: int of the grid height and width
     return:
     pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
     """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid_h = np.arange(joint_size, dtype=np.float32)
+    grid_w = np.arange(motion_size, dtype=np.float32)
     grid = np.meshgrid(grid_w, grid_h)  # here w goes first
     grid = np.stack(grid, axis=0)
 
-    grid = grid.reshape([2, 1, grid_size, grid_size])
+    grid = grid.reshape([2, 1, joint_size, motion_size])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
     if cls_token and extra_tokens > 0:
         pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
@@ -299,6 +370,18 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
     return emb
 
+def get_1d_sincos_pos_embed(embed_dim, motion_size, cls_token=False, extra_tokens=0):
+    """
+    array size: int of the motion length
+    return:
+    pos_embed: [motion_size, embed_dim] or [1+motion_size, embed_dim] (w/ or w/o cls_token)
+    """
+    arr = np.arange(motion_size, dtype=np.float32)
+
+    pos_embed = get_1d_sincos_pos_embed_from_grid(embed_dim, arr)
+    if cls_token and extra_tokens > 0:
+        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+    return pos_embed
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -325,46 +408,43 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #                                   DiT Configs                                  #
 #################################################################################
 
-def DiT_XL_2(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+def DiT_XL(**kwargs):
+    return DiT(depth=28, hidden_size=1152, num_heads=16, **kwargs)
 
-def DiT_XL_4(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+def DiT_L(**kwargs):
+    return DiT(depth=24, hidden_size=1024, num_heads=16, **kwargs)
 
-def DiT_XL_8(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+def DiT_B(**kwargs):
+    return DiT(depth=12, hidden_size=768, num_heads=12, **kwargs)
 
-def DiT_L_2(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
-
-def DiT_L_4(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
-
-def DiT_L_8(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
-
-def DiT_B_2(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
-
-def DiT_B_4(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
-
-def DiT_B_8(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
-
-def DiT_S_2(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
-
-def DiT_S_4(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
-
-def DiT_S_8(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+def DiT_S(**kwargs):
+    return DiT(depth=6, hidden_size=384, num_heads=6, **kwargs)
 
 
 DiT_models = {
-    'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
-    'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
-    'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
-    'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
+    'DiT-XL': DiT_XL,
+    'DiT-L':  DiT_L, 
+    'DiT-B':  DiT_B, 
+    'DiT-S':  DiT_S, 
 }
+
+if __name__ == '__main__':
+    model = DiT_models['DiT-S']
+    x = torch.rand([8, 263, 120])
+    texts = [
+        'a man running on the ground',
+        'a man running on the ground',
+        'a man running on the ground',
+        'a man running on the ground',
+        'a man running on the ground',
+        'a man running on the ground',
+        'a man running on the ground',
+        'a man running on the ground',
+    ]
+    t = torch.tensor([
+        1, 2, 3, 4, 5, 6, 7, 8
+    ])
+    model = model(encode_type='bert')
+    x_p = model.forward(x, t, texts)
+    print(x_p, x_p.shape, x.shape)
+

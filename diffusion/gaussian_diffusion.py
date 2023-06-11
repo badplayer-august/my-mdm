@@ -19,6 +19,11 @@ def mean_flat(tensor):
     """
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
+def sum_flat(tensor):
+    """
+    Take the sum over all non-batch dimensions.
+    """
+    return tensor.sum(dim=list(range(1, len(tensor.shape))))
 
 class ModelMeanType(enum.Enum):
     """
@@ -156,12 +161,27 @@ class GaussianDiffusion:
         betas,
         model_mean_type,
         model_var_type,
-        loss_type
+        loss_type,
+        lambda_rcxyz=0.,
+        lambda_vel=0.,
+        data_rep='rot6d',
+        lambda_vel_rcxyz=0.,
+        lambda_fc=0.,
     ):
 
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
         self.loss_type = loss_type
+
+        self.data_rep = data_rep
+
+        self.lambda_rcxyz = lambda_rcxyz
+        self.lambda_vel = lambda_vel
+        self.lambda_vel_rcxyz = lambda_vel_rcxyz
+        self.lambda_fc = lambda_fc
+
+        if self.lambda_rcxyz > 0. or self.lambda_vel > 0. or self.lambda_vel_rcxyz > 0. or self.lambda_fc > 0.:
+            assert self.loss_type == LossType.MSE, 'Geometric losses are supported by MSE loss type only!'
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -199,6 +219,23 @@ class GaussianDiffusion:
         self.posterior_mean_coef2 = (
             (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
         )
+
+        self.l2_loss = lambda a, b: (a - b) ** 2  # th.nn.MSELoss(reduction='none')  # must be None for handling mask later on.
+
+
+    def masked_l2(self, a, b, mask):
+        # assuming a.shape == b.shape == bs, J, Jdim, seqlen
+        # assuming mask.shape == bs, 1, 1, seqlen
+        loss = self.l2_loss(a, b)
+        loss = sum_flat(loss * mask.float())  # gives \sigma_euclidean over unmasked elements
+        n_entries = a.shape[1] * a.shape[2]
+        non_zero_elements = sum_flat(mask) * n_entries
+        # print('mask', mask.shape)
+        # print('non_zero_elements', non_zero_elements)
+        # print('loss', loss)
+        mse_loss_val = loss / non_zero_elements
+        # print('mse_loss_val', mse_loss_val)
+        return mse_loss_val
 
     def q_mean_variance(self, x_start, t):
         """
@@ -712,7 +749,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, mask, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -776,11 +813,10 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
-            if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
-            else:
-                terms["loss"] = terms["mse"]
+            terms["rot_mse"] = self.masked_l2(target, model_output, mask) # mean_flat(rot_mse)
+
+            terms["loss"] = terms["rot_mse"]
+
         else:
             raise NotImplementedError(self.loss_type)
 

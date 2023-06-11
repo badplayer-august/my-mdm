@@ -8,5 +8,6 @@ if __name__ == '__main__':
         print(motion)
         print(motion.shape)
         print(cond)
+        print(cond['y'])
         joint_vec = np.load('dataset/HumanML3D/new_joint_vecs/000000.npy')
         break
